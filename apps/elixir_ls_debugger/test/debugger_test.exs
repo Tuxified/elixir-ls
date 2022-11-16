@@ -29,71 +29,100 @@ defmodule ElixirLS.Debugger.ServerTest do
 
   describe "initialize" do
     test "succeeds", %{server: server} do
-      Server.receive_packet(server, initialize_req(1, %{"clientID" => "some_id"}))
-      assert_receive(response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true}))
-      assert :sys.get_state(server).client_info == %{"clientID" => "some_id"}
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{"clientID" => "some_id"}))
+
+        assert_receive(
+          response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true})
+        )
+
+        assert :sys.get_state(server).client_info == %{"clientID" => "some_id"}
+      end)
     end
 
     test "fails when already initialized", %{server: server} do
-      Server.receive_packet(server, initialize_req(1, %{"clientID" => "some_id"}))
-      assert_receive(response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true}))
-      Server.receive_packet(server, initialize_req(2, %{"clientID" => "some_id"}))
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{"clientID" => "some_id"}))
 
-      assert_receive(
-        error_response(
-          _,
-          2,
-          "initialize",
-          "invalidRequest",
-          "Debugger request {command} was not expected",
-          %{"command" => "initialize"}
+        assert_receive(
+          response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true})
         )
-      )
+
+        Server.receive_packet(server, initialize_req(2, %{"clientID" => "some_id"}))
+
+        assert_receive(
+          error_response(
+            _,
+            2,
+            "initialize",
+            "invalidRequest",
+            "Debugger request {command} was not expected",
+            %{"command" => "initialize"}
+          )
+        )
+      end)
     end
 
     test "rejects requests when not initialized", %{server: server} do
-      Server.receive_packet(
-        server,
-        set_breakpoints_req(1, %{"path" => "lib/mix_project.ex"}, [%{"line" => 3}])
-      )
-
-      assert_receive(
-        error_response(
-          _,
-          1,
-          "setBreakpoints",
-          "invalidRequest",
-          "Debugger request {command} was not expected",
-          %{"command" => "setBreakpoints"}
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(
+          server,
+          set_breakpoints_req(1, %{"path" => "lib/mix_project.ex"}, [%{"line" => 3}])
         )
-      )
+
+        assert_receive(
+          error_response(
+            _,
+            1,
+            "setBreakpoints",
+            "invalidRequest",
+            "Debugger request {command} was not expected",
+            %{"command" => "setBreakpoints"}
+          )
+        )
+      end)
     end
   end
 
   describe "disconnect" do
     test "succeeds when not initialized", %{server: server} do
-      Process.flag(:trap_exit, true)
-      Server.receive_packet(server, request(1, "disconnect"))
-      assert_receive(response(_, 1, "disconnect", %{}))
-      assert_receive({:EXIT, ^server, {:exit_code, 0}})
-      Process.flag(:trap_exit, false)
+      in_fixture(__DIR__, "mix_project", fn ->
+        Process.flag(:trap_exit, true)
+        Server.receive_packet(server, request(1, "disconnect"))
+        assert_receive(response(_, 1, "disconnect", %{}))
+        assert_receive({:EXIT, ^server, {:exit_code, 0}})
+        Process.flag(:trap_exit, false)
+      end)
     end
 
     test "succeeds when initialized", %{server: server} do
-      Process.flag(:trap_exit, true)
-      Server.receive_packet(server, initialize_req(1, %{"clientID" => "some_id"}))
-      assert_receive(response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true}))
-      Server.receive_packet(server, request(2, "disconnect"))
-      assert_receive(response(_, 2, "disconnect", %{}))
-      assert_receive({:EXIT, ^server, {:exit_code, 0}})
-      Process.flag(:trap_exit, false)
+      in_fixture(__DIR__, "mix_project", fn ->
+        Process.flag(:trap_exit, true)
+        Server.receive_packet(server, initialize_req(1, %{"clientID" => "some_id"}))
+
+        assert_receive(
+          response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true})
+        )
+
+        Server.receive_packet(server, request(2, "disconnect"))
+        assert_receive(response(_, 2, "disconnect", %{}))
+        assert_receive({:EXIT, ^server, {:exit_code, 0}})
+        Process.flag(:trap_exit, false)
+      end)
     end
   end
 
   @tag :fixture
   test "basic debugging", %{server: server} do
     in_fixture(__DIR__, "mix_project", fn ->
-      Server.receive_packet(server, initialize_req(1, %{}))
+      Server.receive_packet(
+        server,
+        initialize_req(1, %{
+          "supportsVariablePaging" => true,
+          "supportsVariableType" => true
+        })
+      )
+
       assert_receive(response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true}))
 
       Server.receive_packet(
@@ -166,6 +195,13 @@ defmodule ElixirLS.Debugger.ServerTest do
                          },
                          %{
                            "expensive" => false,
+                           "indexedVariables" => 0,
+                           "name" => "process info",
+                           "namedVariables" => _,
+                           "variablesReference" => _
+                         },
+                         %{
+                           "expensive" => false,
                            "indexedVariables" => 1,
                            "name" => "arguments",
                            "namedVariables" => 0,
@@ -189,7 +225,7 @@ defmodule ElixirLS.Debugger.ServerTest do
                      1000
 
       Server.receive_packet(server, continue_req(10, thread_id))
-      assert_receive response(_, 10, "continue", %{"allThreadsContinued" => false})
+      assert_receive response(_, 10, "continue", %{"allThreadsContinued" => true})
     end)
   end
 
@@ -326,7 +362,7 @@ defmodule ElixirLS.Debugger.ServerTest do
                      )
 
       Server.receive_packet(server, continue_req(15, thread_id))
-      assert_receive response(_, 15, "continue", %{"allThreadsContinued" => false})
+      assert_receive response(_, 15, "continue", %{"allThreadsContinued" => true})
 
       Server.receive_packet(server, stacktrace_req(7, thread_id))
       thread_id_str = inspect(thread_id)
@@ -388,7 +424,7 @@ defmodule ElixirLS.Debugger.ServerTest do
                      }),
                      500
 
-      {log, stderr} =
+      {log, _stderr} =
         capture_log_and_io(:standard_error, fn ->
           assert_receive event(_, "thread", %{
                            "reason" => "exited",
@@ -398,7 +434,6 @@ defmodule ElixirLS.Debugger.ServerTest do
         end)
 
       assert log =~ "Fixture MixProject expected error"
-      assert stderr =~ "Fixture MixProject expected error"
     end)
   end
 
@@ -447,7 +482,7 @@ defmodule ElixirLS.Debugger.ServerTest do
                      }),
                      5000
 
-      {log, io} =
+      {log, _io} =
         capture_log_and_io(:stderr, fn ->
           assert_receive event(_, "thread", %{
                            "reason" => "exited",
@@ -457,7 +492,6 @@ defmodule ElixirLS.Debugger.ServerTest do
         end)
 
       assert log =~ "Fixture MixProject raise for exit_self/0"
-      assert io =~ "Fixture MixProject raise for exit_self/0"
 
       assert_receive event(_, "exited", %{
                        "exitCode" => 1
@@ -467,6 +501,149 @@ defmodule ElixirLS.Debugger.ServerTest do
                        "restart" => false
                      })
     end)
+  end
+
+  @tag :fixture
+  test "terminate threads", %{server: server} do
+    in_fixture(__DIR__, "mix_project", fn ->
+      Server.receive_packet(server, initialize_req(1, %{}))
+      assert_receive(response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true}))
+
+      Server.receive_packet(
+        server,
+        launch_req(2, %{
+          "request" => "launch",
+          "type" => "mix_task",
+          "task" => "run",
+          "taskArgs" => ["-e", "MixProject.Some.sleep()"],
+          "projectDir" => File.cwd!()
+        })
+      )
+
+      assert_receive(response(_, 2, "launch", %{}), 5000)
+      assert_receive(event(_, "initialized", %{}))
+
+      Server.receive_packet(server, request(5, "configurationDone", %{}))
+      assert_receive(response(_, 5, "configurationDone", %{}))
+      Process.sleep(1000)
+      Server.receive_packet(server, request(6, "threads", %{}))
+      assert_receive(response(_, 6, "threads", %{"threads" => threads}), 1_000)
+
+      assert [thread_id] =
+               threads
+               |> Enum.filter(&(&1["name"] |> String.starts_with?("MixProject.Some")))
+               |> Enum.map(& &1["id"])
+
+      Server.receive_packet(server, request(7, "terminateThreads", %{"threadIds" => [thread_id]}))
+      assert_receive(response(_, 7, "terminateThreads", %{}), 500)
+
+      assert_receive event(_, "thread", %{
+                       "reason" => "exited",
+                       "threadId" => ^thread_id
+                     }),
+                     5000
+    end)
+  end
+
+  describe "pause" do
+    @tag :fixture
+    test "alive", %{server: server} do
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{}))
+
+        assert_receive(
+          response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true})
+        )
+
+        Server.receive_packet(
+          server,
+          launch_req(2, %{
+            "request" => "launch",
+            "type" => "mix_task",
+            "task" => "run",
+            "taskArgs" => ["-e", "MixProject.Some.sleep()"],
+            "projectDir" => File.cwd!()
+          })
+        )
+
+        assert_receive(response(_, 2, "launch", %{}), 5000)
+        assert_receive(event(_, "initialized", %{}))
+
+        Server.receive_packet(server, request(5, "configurationDone", %{}))
+        assert_receive(response(_, 5, "configurationDone", %{}))
+        Process.sleep(1000)
+        Server.receive_packet(server, request(6, "threads", %{}))
+        assert_receive(response(_, 6, "threads", %{"threads" => threads}), 1_000)
+
+        assert [thread_id] =
+                 threads
+                 |> Enum.filter(&(&1["name"] |> String.starts_with?("MixProject.Some")))
+                 |> Enum.map(& &1["id"])
+
+        Server.receive_packet(server, request(7, "pause", %{"threadId" => thread_id}))
+        assert_receive(response(_, 7, "pause", %{}), 500)
+
+        assert_receive event(_, "stopped", %{
+                         "allThreadsStopped" => false,
+                         "reason" => "pause",
+                         "threadId" => ^thread_id
+                       }),
+                       500
+
+        assert_receive event(_, "output", %{
+                         "category" => "important",
+                         "output" => "Failed to obtain meta for pid" <> _
+                       })
+      end)
+    end
+
+    @tag :fixture
+    test "dead", %{server: server} do
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{}))
+
+        assert_receive(
+          response(_, 1, "initialize", %{"supportsConfigurationDoneRequest" => true})
+        )
+
+        Server.receive_packet(
+          server,
+          launch_req(2, %{
+            "request" => "launch",
+            "type" => "mix_task",
+            "task" => "run",
+            "taskArgs" => ["-e", "MixProject.Some.sleep()"],
+            "projectDir" => File.cwd!()
+          })
+        )
+
+        assert_receive(response(_, 2, "launch", %{}), 5000)
+        assert_receive(event(_, "initialized", %{}))
+
+        Server.receive_packet(server, request(5, "configurationDone", %{}))
+        assert_receive(response(_, 5, "configurationDone", %{}))
+        Process.sleep(1000)
+        Server.receive_packet(server, request(6, "threads", %{}))
+        assert_receive(response(_, 6, "threads", %{"threads" => threads}), 1_000)
+
+        assert [thread_id] =
+                 threads
+                 |> Enum.filter(&(&1["name"] |> String.starts_with?("MixProject.Some")))
+                 |> Enum.map(& &1["id"])
+
+        Process.whereis(MixProject.Some) |> Process.exit(:kill)
+        Process.sleep(1000)
+
+        Server.receive_packet(server, request(7, "pause", %{"threadId" => thread_id}))
+        assert_receive(response(_, 7, "pause", %{}), 500)
+
+        assert_receive event(_, "thread", %{
+                         "reason" => "exited",
+                         "threadId" => ^thread_id
+                       }),
+                       5000
+      end)
+    end
   end
 
   describe "breakpoints" do
@@ -1304,95 +1481,129 @@ defmodule ElixirLS.Debugger.ServerTest do
     end
 
     test "Evaluate expression with OK result", %{server: server} do
-      Server.receive_packet(server, initialize_req(1, %{}))
-      assert_receive(response(_, 1, "initialize", _))
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{}))
+        assert_receive(response(_, 1, "initialize", _))
 
-      Server.receive_packet(
-        server,
-        gen_watch_expression_packet("1 + 2 + 3 + 4")
-      )
+        Server.receive_packet(
+          server,
+          gen_watch_expression_packet("1 + 2 + 3 + 4")
+        )
 
-      assert_receive(%{"body" => %{"result" => "10"}}, 1000)
+        assert_receive(%{"body" => %{"result" => "10"}}, 1000)
 
-      assert Process.alive?(server)
+        assert Process.alive?(server)
+      end)
     end
 
     @tag :capture_log
     test "Evaluate expression with ERROR result", %{server: server} do
-      Server.receive_packet(server, initialize_req(1, %{}))
-      assert_receive(response(_, 1, "initialize", _))
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{}))
+        assert_receive(response(_, 1, "initialize", _))
 
-      Server.receive_packet(
-        server,
-        gen_watch_expression_packet("1 = 2")
-      )
+        Server.receive_packet(
+          server,
+          gen_watch_expression_packet("1 = 2")
+        )
 
-      assert_receive(%{"body" => %{"result" => result}}, 1000)
+        assert_receive(%{"body" => %{"result" => result}}, 1000)
 
-      assert result =~ ~r/badmatch/
+        assert result =~ ~r/badmatch/
 
-      assert Process.alive?(server)
+        assert Process.alive?(server)
+      end)
     end
 
     test "Evaluate expression with attempt to exit debugger process", %{server: server} do
-      Server.receive_packet(server, initialize_req(1, %{}))
-      assert_receive(response(_, 1, "initialize", _))
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{}))
+        assert_receive(response(_, 1, "initialize", _))
 
-      Server.receive_packet(
-        server,
-        gen_watch_expression_packet("Process.exit(self(), :normal)")
-      )
+        Server.receive_packet(
+          server,
+          gen_watch_expression_packet("Process.exit(self(), :normal)")
+        )
 
-      assert_receive(%{"body" => %{"result" => result}}, 1000)
+        assert_receive(%{"body" => %{"result" => result}}, 1000)
 
-      assert result =~ ~r/:exit/
+        assert result =~ ~r/:exit/
 
-      assert Process.alive?(server)
+        assert Process.alive?(server)
+      end)
     end
 
     test "Evaluate expression with attempt to throw debugger process", %{server: server} do
-      Server.receive_packet(server, initialize_req(1, %{}))
-      assert_receive(response(_, 1, "initialize", _))
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{}))
+        assert_receive(response(_, 1, "initialize", _))
 
-      Server.receive_packet(
-        server,
-        gen_watch_expression_packet("throw(:goodmorning_bug)")
-      )
+        Server.receive_packet(
+          server,
+          gen_watch_expression_packet("throw(:goodmorning_bug)")
+        )
 
-      assert_receive(%{"body" => %{"result" => result}}, 1000)
+        assert_receive(%{"body" => %{"result" => result}}, 1000)
 
-      assert result =~ ~r/:goodmorning_bug/
+        assert result =~ ~r/:goodmorning_bug/
 
-      assert Process.alive?(server)
+        assert Process.alive?(server)
+      end)
     end
 
     test "Evaluate expression which has long execution", %{server: server} do
+      in_fixture(__DIR__, "mix_project", fn ->
+        Server.receive_packet(server, initialize_req(1, %{}))
+        assert_receive(response(_, 1, "initialize", _))
+
+        Server.receive_packet(
+          server,
+          launch_req(2, %{
+            "request" => "launch",
+            "type" => "mix_task",
+            "task" => "test",
+            "projectDir" => File.cwd!(),
+            "debugExpressionTimeoutMs" => 500
+          })
+        )
+
+        assert_receive(response(_, 2, "launch", %{}), 5000)
+
+        Server.receive_packet(
+          server,
+          gen_watch_expression_packet(":timer.sleep(10_000)")
+        )
+
+        assert_receive(%{"body" => %{"result" => result}}, 1100)
+
+        assert result =~ ~r/:elixir_ls_expression_timeout/
+
+        assert Process.alive?(server)
+      end)
+    end
+  end
+
+  test "Completions", %{server: server} do
+    in_fixture(__DIR__, "mix_project", fn ->
       Server.receive_packet(server, initialize_req(1, %{}))
       assert_receive(response(_, 1, "initialize", _))
 
       Server.receive_packet(
         server,
-        launch_req(2, %{
-          "request" => "launch",
-          "type" => "mix_task",
-          "task" => "test",
-          "projectDir" => File.cwd!(),
-          "debugExpressionTimeoutMs" => 500
-        })
+        %{
+          "arguments" => %{
+            "text" => "DateTi",
+            "column" => 7
+          },
+          "command" => "completions",
+          "seq" => 1,
+          "type" => "request"
+        }
       )
 
-      assert_receive(response(_, 2, "launch", %{}), 5000)
-
-      Server.receive_packet(
-        server,
-        gen_watch_expression_packet(":timer.sleep(10_000)")
-      )
-
-      assert_receive(%{"body" => %{"result" => result}}, 1100)
-
-      assert result =~ ~r/:elixir_ls_expression_timeout/
+      assert_receive(%{"body" => %{"targets" => _targets}}, 10000)
 
       assert Process.alive?(server)
-    end
+    end)
   end
 end

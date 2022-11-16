@@ -5,8 +5,7 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbolsTest do
   setup do
     alias ElixirLS.Utils.PacketCapture
     packet_capture = start_supervised!({PacketCapture, self()})
-
-    {:ok, pid} = WorkspaceSymbols.start_link(name: nil)
+    {:ok, pid} = start_supervised({WorkspaceSymbols, name: nil})
     Process.group_leader(pid, packet_capture)
 
     state = :sys.get_state(pid)
@@ -14,7 +13,7 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbolsTest do
     fixture_uri =
       ElixirLS.LanguageServer.Fixtures.WorkspaceSymbols.module_info(:compile)[:source]
       |> List.to_string()
-      |> ElixirLS.LanguageServer.SourceFile.path_to_uri()
+      |> ElixirLS.LanguageServer.SourceFile.Path.to_uri()
 
     :sys.replace_state(pid, fn _ ->
       %{
@@ -36,11 +35,6 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbolsTest do
 
   test "empty query", %{server: server} do
     assert {:ok, []} == WorkspaceSymbols.symbols("", server)
-
-    assert_receive %{
-      "method" => "window/logMessage",
-      "params" => %{"message" => "[ElixirLS WorkspaceSymbols] Updating index..."}
-    }
   end
 
   test "returns modules", %{server: server} do

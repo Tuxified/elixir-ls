@@ -4,6 +4,7 @@ defmodule ElixirLS.Debugger.BreakpointCondition do
   """
 
   use GenServer
+  alias ElixirLS.Debugger.Output
   @range 0..99
 
   def start_link(args) do
@@ -38,7 +39,8 @@ defmodule ElixirLS.Debugger.BreakpointCondition do
     GenServer.call(name, {:has_condition?, {module, lines}})
   end
 
-  @spec get_condition(module, non_neg_integer) :: {String.t(), non_neg_integer, non_neg_integer}
+  @spec get_condition(module, non_neg_integer) ::
+          {String.t(), String.t(), non_neg_integer, non_neg_integer}
   def get_condition(name \\ __MODULE__, number) do
     GenServer.call(name, {:get_condition, number})
   end
@@ -162,7 +164,7 @@ defmodule ElixirLS.Debugger.BreakpointCondition do
         # Debug Adapter Protocol:
         # If this attribute exists and is non-empty, the backend must not 'break' (stop)
         # but log the message instead. Expressions within {} are interpolated.
-        IO.puts(interpolate(log_message, elixir_binding))
+        Output.debugger_console(interpolate(log_message, elixir_binding))
         false
       else
         result
@@ -170,6 +172,7 @@ defmodule ElixirLS.Debugger.BreakpointCondition do
     end
   end
 
+  @spec eval_condition(String.t(), keyword) :: boolean
   def eval_condition("true", _binding), do: true
 
   def eval_condition(condition, elixir_binding) do
@@ -178,7 +181,10 @@ defmodule ElixirLS.Debugger.BreakpointCondition do
       if term, do: true, else: false
     catch
       kind, error ->
-        IO.warn("Error in conditional breakpoint: " <> Exception.format_banner(kind, error))
+        Output.debugger_important(
+          "Error in conditional breakpoint: " <> Exception.format_banner(kind, error)
+        )
+
         false
     end
   end
@@ -189,7 +195,10 @@ defmodule ElixirLS.Debugger.BreakpointCondition do
       to_string(term)
     catch
       kind, error ->
-        IO.warn("Error in log message interpolation: " <> Exception.format_banner(kind, error))
+        Output.debugger_important(
+          "Error in log message interpolation: " <> Exception.format_banner(kind, error)
+        )
+
         ""
     end
   end
@@ -220,7 +229,7 @@ defmodule ElixirLS.Debugger.BreakpointCondition do
         interpolate(expression_rest, [eval_result | acc], elixir_binding)
 
       :error ->
-        IO.warn("Log message has unpaired or nested `{}`")
+        Output.debugger_important("Log message has unpaired or nested `{}`")
         acc
     end
   end

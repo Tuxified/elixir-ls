@@ -1,5 +1,6 @@
 defmodule ElixirLS.LanguageServer.Providers.Hover do
   alias ElixirLS.LanguageServer.SourceFile
+  import ElixirLS.LanguageServer.Protocol
 
   @moduledoc """
   Hover provider utilizing Elixir Sense
@@ -17,16 +18,18 @@ defmodule ElixirLS.LanguageServer.Providers.Hover do
                 |> Enum.map(fn x -> "lib/#{x}/lib" end)
 
   def hover(text, line, character, project_dir) do
+    {line, character} = SourceFile.lsp_position_to_elixir(text, {line, character})
+
     response =
-      case ElixirSense.docs(text, line + 1, character + 1) do
+      case ElixirSense.docs(text, line, character) do
         %{subject: ""} ->
           nil
 
-        %{subject: subject, docs: docs} ->
-          line_text = Enum.at(SourceFile.lines(text), line)
-          range = highlight_range(line_text, line, character, subject)
+        %{subject: subject, docs: docs, actual_subject: actual_subject} ->
+          line_text = Enum.at(SourceFile.lines(text), line - 1)
+          range = highlight_range(line_text, line - 1, character - 1, subject)
 
-          %{"contents" => contents(docs, subject, project_dir), "range" => range}
+          %{"contents" => contents(docs, actual_subject, project_dir), "range" => range}
       end
 
     {:ok, response}
@@ -45,10 +48,12 @@ defmodule ElixirLS.LanguageServer.Providers.Hover do
 
     Enum.find_value(regex_ranges, fn
       [{start, length}] when start <= character and character <= start + length ->
-        %{
-          "start" => %{"line" => line, "character" => start},
-          "end" => %{"line" => line, "character" => start + length}
-        }
+        range(
+          line,
+          SourceFile.elixir_character_to_lsp(line_text, start + 1),
+          line,
+          SourceFile.elixir_character_to_lsp(line_text, start + 1 + length)
+        )
 
       _ ->
         nil
@@ -85,7 +90,7 @@ defmodule ElixirLS.LanguageServer.Providers.Hover do
 
     cond do
       erlang_module?(subject) ->
-        # erlang moudle is not support now.
+        # TODO erlang module is currently not supported
         ""
 
       true ->
@@ -131,12 +136,16 @@ defmodule ElixirLS.LanguageServer.Providers.Hover do
   end
 
   defp dep_name(root_mod_name, project_dir) do
-    s = root_mod_name |> source()
+    if not elixir_mod_exported?(root_mod_name) do
+      ""
+    else
+      s = root_mod_name |> source()
 
-    cond do
-      third_dep?(s, project_dir) -> third_dep_name(s, project_dir)
-      builtin?(s) -> builtin_dep_name(s)
-      true -> ""
+      cond do
+        third_dep?(s, project_dir) -> third_dep_name(s, project_dir)
+        builtin?(s) -> builtin_dep_name(s)
+        true -> ""
+      end
     end
   end
 
@@ -148,6 +157,12 @@ defmodule ElixirLS.LanguageServer.Providers.Hover do
     dep = ("Elixir." <> mod_name) |> String.to_atom()
     dep.__info__(:compile) |> Keyword.get(:source) |> List.to_string()
   end
+
+  defp elixir_mod_exported?(mod_name) do
+    ("Elixir." <> mod_name) |> String.to_atom() |> function_exported?(:__info__, 1)
+  end
+
+  defp third_dep?(_source, nil), do: false
 
   defp third_dep?(source, project_dir) do
     prefix = project_dir <> "/deps"

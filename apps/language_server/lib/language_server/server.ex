@@ -16,7 +16,8 @@ defmodule ElixirLS.LanguageServer.Server do
   """
 
   use GenServer
-  alias ElixirLS.LanguageServer.{SourceFile, Build, Protocol, JsonRpc, Dialyzer}
+  require Logger
+  alias ElixirLS.LanguageServer.{SourceFile, Build, Protocol, JsonRpc, Dialyzer, Diagnostics}
 
   alias ElixirLS.LanguageServer.Providers.{
     Completion,
@@ -32,10 +33,13 @@ defmodule ElixirLS.LanguageServer.Server do
     OnTypeFormatting,
     CodeLens,
     ExecuteCommand,
-    FoldingRange
+    FoldingRange,
+    CodeAction
   }
 
   alias ElixirLS.Utils.Launch
+  alias ElixirLS.LanguageServer.Tracer
+  alias ElixirLS.Utils.MixfileHelpers
 
   use Protocol
 
@@ -50,7 +54,6 @@ defmodule ElixirLS.LanguageServer.Server do
     build_diagnostics: [],
     dialyzer_diagnostics: [],
     needs_build?: false,
-    load_all_modules?: false,
     build_running?: false,
     analysis_ready?: false,
     received_shutdown?: false,
@@ -59,6 +62,7 @@ defmodule ElixirLS.LanguageServer.Server do
     source_files: %{},
     awaiting_contracts: [],
     supports_dynamic: false,
+    mix_project?: false,
     no_mixfile_warned?: false
   ]
 
@@ -135,10 +139,7 @@ defmodule ElixirLS.LanguageServer.Server do
   def handle_call({:suggest_contracts, uri = "file:" <> _}, from, state = %__MODULE__{}) do
     case state do
       %{analysis_ready?: true, source_files: %{^uri => %{dirty?: false}}} ->
-        abs_path =
-          uri
-          |> SourceFile.abs_path_from_uri()
-
+        abs_path = SourceFile.Path.absolute_from_uri(uri)
         {:reply, Dialyzer.suggest_contracts([abs_path]), state}
 
       %{source_files: %{^uri => _}} ->
@@ -208,8 +209,7 @@ defmodule ElixirLS.LanguageServer.Server do
     state =
       case state do
         %{settings: nil} ->
-          JsonRpc.show_message(
-            :info,
+          Logger.warn(
             "Did not receive workspace/didChangeConfiguration notification after 5 seconds. " <>
               "Using default settings."
           )
@@ -233,7 +233,7 @@ defmodule ElixirLS.LanguageServer.Server do
     state =
       case reason do
         :normal -> state
-        _ -> handle_build_result(:error, [Build.exception_to_diagnostic(reason)], state)
+        _ -> handle_build_result(:error, [Diagnostics.exception_to_diagnostic(reason)], state)
       end
 
     if reason == :normal do
@@ -281,10 +281,7 @@ defmodule ElixirLS.LanguageServer.Server do
         %{state | requests: Map.delete(requests, id)}
 
       _ ->
-        JsonRpc.log_message(
-          :warning,
-          "Received $/cancelRequest for unknown request id: #{inspect(id)}"
-        )
+        Logger.warn("Received $/cancelRequest for unknown request id: #{inspect(id)}")
 
         state
     end
@@ -324,8 +321,7 @@ defmodule ElixirLS.LanguageServer.Server do
     if Map.has_key?(state.source_files, uri) do
       # An open notification must not be sent more than once without a corresponding
       # close notification send before
-      JsonRpc.log_message(
-        :warning,
+      Logger.warn(
         "Received textDocument/didOpen for file that is already open. Received uri: #{inspect(uri)}"
       )
 
@@ -333,7 +329,7 @@ defmodule ElixirLS.LanguageServer.Server do
     else
       source_file = %SourceFile{text: text, version: version}
 
-      Build.publish_file_diagnostics(
+      Diagnostics.publish_file_diagnostics(
         uri,
         state.build_diagnostics ++ state.dialyzer_diagnostics,
         source_file
@@ -346,8 +342,7 @@ defmodule ElixirLS.LanguageServer.Server do
   defp handle_notification(did_close(uri), state = %__MODULE__{}) do
     if not Map.has_key?(state.source_files, uri) do
       # A close notification requires a previous open notification to be sent
-      JsonRpc.log_message(
-        :warning,
+      Logger.warn(
         "Received textDocument/didClose for file that is not open. Received uri: #{inspect(uri)}"
       )
 
@@ -368,8 +363,7 @@ defmodule ElixirLS.LanguageServer.Server do
       # The source file was not marked as open either due to a bug in the
       # client or a restart of the server. So just ignore the message and do
       # not update the state
-      JsonRpc.log_message(
-        :warning,
+      Logger.warn(
         "Received textDocument/didChange for file that is not open. Received uri: #{inspect(uri)}"
       )
 
@@ -384,8 +378,7 @@ defmodule ElixirLS.LanguageServer.Server do
 
   defp handle_notification(did_save(uri), state = %__MODULE__{}) do
     if not Map.has_key?(state.source_files, uri) do
-      JsonRpc.log_message(
-        :warning,
+      Logger.warn(
         "Received textDocument/didSave for file that is not open. Received uri: #{inspect(uri)}"
       )
 
@@ -406,12 +399,27 @@ defmodule ElixirLS.LanguageServer.Server do
 
     needs_build =
       Enum.any?(changes, fn %{"uri" => uri = "file:" <> _, "type" => type} ->
-        path = SourceFile.path_from_uri(uri)
+        path = SourceFile.Path.from_uri(uri)
 
-        Path.extname(path) in (additional_watched_extensions ++ @default_watched_extensions) and
+        relative_path = Path.relative_to(path, state.project_dir)
+        first_path_segment = relative_path |> Path.split() |> hd
+
+        first_path_segment not in [".elixir_ls", "_build"] and
+          Path.extname(path) in (additional_watched_extensions ++ @default_watched_extensions) and
           (type in [1, 3] or not Map.has_key?(state.source_files, uri) or
              state.source_files[uri].dirty?)
       end)
+
+    # TODO remove uniq when duplicated subscriptions from vscode plugin are fixed
+    deleted_paths =
+      for change <- changes,
+          change["type"] == 3,
+          uniq: true,
+          do: SourceFile.Path.from_uri(change["uri"])
+
+    for path <- deleted_paths do
+      Tracer.notify_file_deleted(path)
+    end
 
     source_files =
       changes
@@ -424,7 +432,7 @@ defmodule ElixirLS.LanguageServer.Server do
           # file created/updated - set dirty flag to false if file contents are equal
           case acc[uri] do
             %SourceFile{text: source_file_text, dirty?: true} = source_file ->
-              case File.read(SourceFile.path_from_uri(uri)) do
+              case File.read(SourceFile.Path.from_uri(uri)) do
                 {:ok, ^source_file_text} ->
                   Map.put(acc, uri, %SourceFile{source_file | dirty?: false})
 
@@ -432,7 +440,7 @@ defmodule ElixirLS.LanguageServer.Server do
                   acc
 
                 {:error, reason} ->
-                  JsonRpc.log_message(:warning, "Unable to read #{uri}: #{inspect(reason)}")
+                  Logger.warn("Unable to read #{uri}: #{inspect(reason)}")
                   # keep dirty if read fails
                   acc
               end
@@ -445,6 +453,7 @@ defmodule ElixirLS.LanguageServer.Server do
 
     state = %{state | source_files: source_files}
 
+    # TODO remove uniq when duplicated subscriptions from vscode plugin are fixed
     changes
     |> Enum.map(& &1["uri"])
     |> Enum.uniq()
@@ -459,7 +468,7 @@ defmodule ElixirLS.LanguageServer.Server do
   end
 
   defp handle_notification(packet, state = %__MODULE__{}) do
-    JsonRpc.log_message(:warning, "Received unmatched notification: #{inspect(packet)}")
+    Logger.warn("Received unmatched notification: #{inspect(packet)}")
     state
   end
 
@@ -519,9 +528,9 @@ defmodule ElixirLS.LanguageServer.Server do
     state =
       case root_uri do
         "file://" <> _ ->
-          root_path = SourceFile.abs_path_from_uri(root_uri)
+          root_path = SourceFile.Path.absolute_from_uri(root_uri)
           File.cd!(root_path)
-          cwd_uri = SourceFile.path_to_uri(File.cwd!())
+          cwd_uri = SourceFile.Path.to_uri(File.cwd!())
           %{state | root_uri: cwd_uri}
 
         nil ->
@@ -671,13 +680,19 @@ defmodule ElixirLS.LanguageServer.Server do
       !!get_in(state.client_capabilities, ["textDocument", "signatureHelp"])
 
     locals_without_parens =
-      case SourceFile.formatter_opts(uri) do
-        {:ok, opts} -> Keyword.get(opts, :locals_without_parens, [])
+      case SourceFile.formatter_for(uri) do
+        {:ok, {_, opts}} -> Keyword.get(opts, :locals_without_parens, [])
         :error -> []
       end
       |> MapSet.new()
 
     signature_after_complete = Map.get(state.settings || %{}, "signatureAfterComplete", true)
+
+    path =
+      case uri do
+        "file:" <> _ -> SourceFile.Path.from_uri(uri)
+        _ -> nil
+      end
 
     fun = fn ->
       Completion.completion(source_file.text, line, character,
@@ -686,7 +701,8 @@ defmodule ElixirLS.LanguageServer.Server do
         tags_supported: tags_supported,
         signature_help_supported: signature_help_supported,
         locals_without_parens: locals_without_parens,
-        signature_after_complete: signature_after_complete
+        signature_after_complete: signature_after_complete,
+        file_path: path
       )
     end
 
@@ -765,7 +781,7 @@ defmodule ElixirLS.LanguageServer.Server do
      fn ->
        case ExecuteCommand.execute(command, args, state) do
          {:error, :invalid_request, _msg} = res ->
-           JsonRpc.log_message(:warning, "Unmatched request: #{inspect(req)}")
+           Logger.warn("Unmatched request: #{inspect(req)}")
            res
 
          other ->
@@ -785,13 +801,17 @@ defmodule ElixirLS.LanguageServer.Server do
     end
   end
 
+  defp handle_request(code_action_req(_id, uri, diagnostics), state = %__MODULE__{}) do
+    {:async, fn -> CodeAction.code_actions(uri, diagnostics) end, state}
+  end
+
   defp handle_request(%{"method" => "$/" <> _}, state = %__MODULE__{}) do
     # "$/" requests that the server doesn't support must return method_not_found
     {:error, :method_not_found, nil, state}
   end
 
   defp handle_request(req, state = %__MODULE__{}) do
-    JsonRpc.log_message(:warning, "Unmatched request: #{inspect(req)}")
+    Logger.warn("Unmatched request: #{inspect(req)}")
     {:error, :invalid_request, nil, state}
   end
 
@@ -837,7 +857,8 @@ defmodule ElixirLS.LanguageServer.Server do
       "workspace" => %{
         "workspaceFolders" => %{"supported" => false, "changeNotifications" => false}
       },
-      "foldingRangeProvider" => true
+      "foldingRangeProvider" => true,
+      "codeActionProvider" => true
     }
   end
 
@@ -861,16 +882,16 @@ defmodule ElixirLS.LanguageServer.Server do
 
   defp get_test_code_lenses(
          state = %__MODULE__{project_dir: project_dir},
-         uri,
+         "file:" <> _ = uri,
          source_file,
          true = _enabled,
          true = _umbrella
        )
        when is_binary(project_dir) do
-    file_path = SourceFile.path_from_uri(uri)
+    file_path = SourceFile.Path.from_uri(uri)
 
     Mix.Project.apps_paths()
-    |> Enum.find(fn {_app, app_path} -> String.contains?(file_path, app_path) end)
+    |> Enum.find(fn {_app, app_path} -> under_app?(file_path, project_dir, app_path) end)
     |> case do
       nil ->
         {:ok, []}
@@ -886,14 +907,14 @@ defmodule ElixirLS.LanguageServer.Server do
 
   defp get_test_code_lenses(
          %__MODULE__{project_dir: project_dir},
-         uri,
+         "file:" <> _ = uri,
          source_file,
          true = _enabled,
          false = _umbrella
        )
        when is_binary(project_dir) do
     try do
-      file_path = SourceFile.path_from_uri(uri)
+      file_path = SourceFile.Path.from_uri(uri)
 
       if is_test_file?(file_path) do
         CodeLens.test_code_lens(uri, source_file.text, project_dir)
@@ -930,29 +951,33 @@ defmodule ElixirLS.LanguageServer.Server do
     |> Enum.any?(&(&1 == file_path))
   end
 
+  defp under_app?(file_path, project_dir, app_path) do
+    file_path_list = file_path |> Path.relative_to(project_dir) |> Path.split()
+    app_path_list = app_path |> Path.split()
+
+    List.starts_with?(file_path_list, app_path_list)
+  end
+
   # Build
 
   defp trigger_build(state = %__MODULE__{project_dir: project_dir}) do
+    build_automatically = Map.get(state.settings || %{}, "autoBuild", true)
+
     cond do
       not build_enabled?(state) ->
         state
 
-      not state.build_running? ->
+      not state.build_running? and build_automatically ->
         fetch_deps? = Map.get(state.settings || %{}, "fetchDeps", false)
 
-        {_pid, build_ref} =
-          Build.build(self(), project_dir,
-            fetch_deps?: fetch_deps?,
-            load_all_modules?: state.load_all_modules?
-          )
+        {_pid, build_ref} = Build.build(self(), project_dir, fetch_deps?: fetch_deps?)
 
         %__MODULE__{
           state
           | build_ref: build_ref,
             needs_build?: false,
             build_running?: true,
-            analysis_ready?: false,
-            load_all_modules?: false
+            analysis_ready?: false
         }
 
       true ->
@@ -1024,7 +1049,7 @@ defmodule ElixirLS.LanguageServer.Server do
     # If these results were triggered by the most recent build and files are not dirty, then we know
     # we're up to date and can release spec suggestions to the code lens provider
     if build_ref == state.build_ref do
-      JsonRpc.log_message(:info, "Dialyzer analysis is up to date")
+      Logger.info("Dialyzer analysis is up to date")
 
       {dirty, not_dirty} =
         state.awaiting_contracts
@@ -1034,14 +1059,14 @@ defmodule ElixirLS.LanguageServer.Server do
 
       contracts_by_file =
         not_dirty
-        |> Enum.map(fn {_from, uri} -> SourceFile.path_from_uri(uri) end)
+        |> Enum.map(fn {_from, uri} -> SourceFile.Path.from_uri(uri) end)
         |> Dialyzer.suggest_contracts()
         |> Enum.group_by(fn {file, _, _, _, _} -> file end)
 
       for {from, uri} <- not_dirty do
         contracts =
           contracts_by_file
-          |> Map.get(SourceFile.path_from_uri(uri), [])
+          |> Map.get(SourceFile.Path.from_uri(uri), [])
 
         GenServer.reply(from, contracts)
       end
@@ -1060,13 +1085,32 @@ defmodule ElixirLS.LanguageServer.Server do
     Dialyzer.check_support() == :ok and build_enabled?(state) and state.dialyzer_sup != nil
   end
 
+  defp safely_read_file(file) do
+    case File.read(file) do
+      {:ok, text} ->
+        text
+
+      {:error, reason} ->
+        if reason != :enoent do
+          Logger.warn("Couldn't read file #{file}: #{inspect(reason)}")
+        end
+
+        nil
+    end
+  end
+
   defp publish_diagnostics(new_diagnostics, old_diagnostics, source_files) do
     files =
       Enum.uniq(Enum.map(new_diagnostics, & &1.file) ++ Enum.map(old_diagnostics, & &1.file))
 
     for file <- files,
-        uri = SourceFile.path_to_uri(file),
-        do: Build.publish_file_diagnostics(uri, new_diagnostics, Map.get(source_files, uri))
+        uri = SourceFile.Path.to_uri(file),
+        do:
+          Diagnostics.publish_file_diagnostics(
+            uri,
+            new_diagnostics,
+            Map.get_lazy(source_files, uri, fn -> safely_read_file(file) end)
+          )
   end
 
   defp show_version_warnings do
@@ -1080,7 +1124,7 @@ defmodule ElixirLS.LanguageServer.Server do
 
     case Dialyzer.check_support() do
       :ok -> :ok
-      {:error, msg} -> JsonRpc.show_message(:info, msg)
+      {:error, msg} -> JsonRpc.show_message(:warning, msg)
     end
 
     :ok
@@ -1105,7 +1149,9 @@ defmodule ElixirLS.LanguageServer.Server do
       |> set_dialyzer_enabled(enable_dialyzer)
       |> add_watched_extensions(additional_watched_extensions)
 
+    maybe_rebuild(state)
     state = create_gitignore(state)
+    Tracer.set_project_dir(state.project_dir)
     trigger_build(%{state | settings: settings})
   end
 
@@ -1124,10 +1170,7 @@ defmodule ElixirLS.LanguageServer.Server do
         :ok
 
       other ->
-        JsonRpc.log_message(
-          :error,
-          "client/registerCapability returned: #{inspect(other)}"
-        )
+        Logger.error("client/registerCapability returned: #{inspect(other)}")
     end
 
     state
@@ -1158,8 +1201,11 @@ defmodule ElixirLS.LanguageServer.Server do
     else
       JsonRpc.show_message(
         :warning,
-        "You must restart ElixirLS after changing environment variables"
+        "Environment variables have changed. ElixirLS needs to restart"
       )
+
+      Process.sleep(5000)
+      System.halt(1)
     end
 
     state
@@ -1171,7 +1217,10 @@ defmodule ElixirLS.LanguageServer.Server do
     if is_nil(prev_env) or env == prev_env do
       Mix.env(String.to_atom(env))
     else
-      JsonRpc.show_message(:warning, "You must restart ElixirLS after changing Mix env")
+      JsonRpc.show_message(:warning, "Mix env change detected. ElixirLS will restart.")
+
+      Process.sleep(5000)
+      System.halt(1)
     end
 
     state
@@ -1191,7 +1240,10 @@ defmodule ElixirLS.LanguageServer.Server do
     if is_nil(prev_target) or target == prev_target do
       Mix.target(String.to_atom(target))
     else
-      JsonRpc.show_message(:warning, "You must restart ElixirLS after changing Mix target")
+      JsonRpc.show_message(:warning, "Mix target change detected. ElixirLS will restart")
+
+      Process.sleep(5000)
+      System.halt(1)
     end
 
     state
@@ -1202,7 +1254,7 @@ defmodule ElixirLS.LanguageServer.Server do
          project_dir
        )
        when is_binary(root_uri) do
-    root_dir = root_uri |> SourceFile.abs_path_from_uri()
+    root_dir = SourceFile.Path.absolute_from_uri(root_uri)
 
     project_dir =
       if is_binary(project_dir) do
@@ -1218,15 +1270,16 @@ defmodule ElixirLS.LanguageServer.Server do
 
       is_nil(prev_project_dir) ->
         File.cd!(project_dir)
-        Map.merge(state, %{project_dir: File.cwd!(), load_all_modules?: true})
+        %{state | project_dir: File.cwd!(), mix_project?: File.exists?(MixfileHelpers.mix_exs())}
 
       prev_project_dir != project_dir ->
         JsonRpc.show_message(
           :warning,
-          "You must restart ElixirLS after changing the project directory"
+          "Project directory change detected. ElixirLS will restart"
         )
 
-        state
+        Process.sleep(5000)
+        System.halt(1)
 
       true ->
         state
@@ -1249,10 +1302,7 @@ defmodule ElixirLS.LanguageServer.Server do
         state
 
       {:error, err} ->
-        JsonRpc.log_message(
-          :warning,
-          "Cannot create .elixir_ls/.gitignore, cause: #{Atom.to_string(err)}"
-        )
+        Logger.warning("Cannot create .elixir_ls/.gitignore, cause: #{Atom.to_string(err)}")
 
         state
     end
@@ -1277,5 +1327,23 @@ defmodule ElixirLS.LanguageServer.Server do
       {from, ^uri} -> GenServer.reply(from, [])
       _ -> false
     end)
+  end
+
+  defp maybe_rebuild(state = %__MODULE__{project_dir: project_dir}) do
+    # detect if we are opening a project that has been compiled without a tracer
+    if is_binary(project_dir) and state.mix_project? and
+         File.dir?(Path.join([project_dir, ".elixir_ls"])) and
+         not Tracer.manifest_version_current?(project_dir) do
+      Logger.info("DETS databases will be rebuilt")
+      Tracer.clean_dets(project_dir)
+
+      case Build.reload_project() do
+        {:ok, _} ->
+          Build.clean(true)
+
+        _ ->
+          :ok
+      end
+    end
   end
 end

@@ -8,25 +8,27 @@ defmodule ElixirLS.LanguageServer.Providers.Rename do
   alias ElixirLS.LanguageServer.SourceFile
 
   def rename(%SourceFile{} = source_file, start_uri, line, character, new_name) do
+    trace = ElixirLS.LanguageServer.Tracer.get_trace()
+
     edits =
       with char_ident when not is_nil(char_ident) <-
              get_char_ident(source_file.text, line, character),
            %ElixirSense.Location{} = definition <-
              ElixirSense.definition(source_file.text, line, character),
-           references <- ElixirSense.references(source_file.text, line, character) do
+           references <- ElixirSense.references(source_file.text, line, character, trace) do
         length_old = length(char_ident)
 
         definition_references =
           case definition do
             %{file: nil, type: :function} ->
               parse_definition_source_code(source_file.text)
-              |> get_all_fn_header_positions(char_ident)
+              |> get_all_fn_header_positions(char_ident, definition)
               |> positions_to_references(start_uri, length_old)
 
             %{file: separate_file_path, type: :function} ->
               parse_definition_source_code(definition)
-              |> get_all_fn_header_positions(char_ident)
-              |> positions_to_references(SourceFile.path_to_uri(separate_file_path), length_old)
+              |> get_all_fn_header_positions(char_ident, definition)
+              |> positions_to_references(SourceFile.Path.to_uri(separate_file_path), length_old)
 
             _ ->
               positions_to_references(
@@ -36,7 +38,7 @@ defmodule ElixirLS.LanguageServer.Providers.Rename do
               )
           end
 
-        definition_references ++ repack_references(references, start_uri)
+        Enum.uniq(definition_references ++ repack_references(references, start_uri))
       else
         _ ->
           []
@@ -49,7 +51,7 @@ defmodule ElixirLS.LanguageServer.Providers.Rename do
         %{
           "textDocument" => %{
             "uri" => uri,
-            "version" => source_file.version + 1
+            "version" => nil
           },
           "edits" =>
             Enum.map(edits, fn edit ->
@@ -66,25 +68,27 @@ defmodule ElixirLS.LanguageServer.Providers.Rename do
       with %{
              begin: {start_line, start_col},
              end: {end_line, end_col},
-             context: {context, char_ident}
-           }
-           when context in [:local_or_var, :local_call] <-
-             Code.Fragment.surround_context(source_file.text, {line, character}) do
+             char_ident: char_ident
+           } = res
+           when not is_nil(res) <-
+             get_begin_end_and_char_ident(source_file.text, line, character) do
         %{
           range: adjust_range(start_line, start_col, end_line, end_col),
           placeholder: to_string(char_ident)
         }
       else
         _ ->
-          # Not a variable or local call, skipping for now
+          # Not a variable or function call, skipping
           nil
       end
 
     {:ok, result}
   end
 
-  defp repack_references(references, uri) do
-    for reference <- references do
+  defp repack_references(references, start_uri) do
+    Enum.map(references, fn reference ->
+      uri = if reference.uri, do: SourceFile.Path.to_uri(reference.uri), else: start_uri
+
       %{
         uri: uri,
         range: %{
@@ -95,21 +99,27 @@ defmodule ElixirLS.LanguageServer.Providers.Rename do
           }
         }
       }
-    end
+    end)
   end
 
   defp parse_definition_source_code(%{file: file}) do
-    ElixirSense.Core.Parser.parse_file(file, true, true, 0)
+    ElixirSense.Core.Parser.parse_file(file, true, true, nil)
   end
 
   defp parse_definition_source_code(source_text) when is_binary(source_text) do
-    ElixirSense.Core.Parser.parse_string(source_text, true, true, 0)
+    ElixirSense.Core.Parser.parse_string(source_text, true, true, nil)
   end
 
-  defp get_all_fn_header_positions(parsed_source, char_ident) do
+  defp get_all_fn_header_positions(
+         parsed_source,
+         definition_name,
+         %{column: column, line: line} = _definition
+       ) do
     parsed_source.mods_funs_to_positions
     |> Map.filter(fn
-      {{_, fn_name, _}, _} -> Atom.to_charlist(fn_name) == char_ident
+      {{_, fn_name, fn_arity}, %{positions: fn_positions}} ->
+        Atom.to_charlist(fn_name) === definition_name and not is_nil(fn_arity) and
+          Enum.member?(fn_positions, {line, column})
     end)
     |> Enum.flat_map(fn {_, %{positions: positions}} -> positions end)
     |> Enum.uniq()
@@ -134,10 +144,23 @@ defmodule ElixirLS.LanguageServer.Providers.Rename do
   end
 
   defp get_char_ident(text, line, character) do
+    case get_begin_end_and_char_ident(text, line, character) do
+      nil -> nil
+      %{char_ident: char_ident} -> char_ident
+    end
+  end
+
+  defp get_begin_end_and_char_ident(text, line, character) do
     case Code.Fragment.surround_context(text, {line, character}) do
-      %{context: {context, char_ident}} when context in [:local_or_var, :local_call] -> char_ident
-      %{context: {:dot, _, char_ident}} -> char_ident
-      _ -> nil
+      %{begin: begin, end: the_end, context: {context, char_ident}}
+      when context in [:local_or_var, :local_call] ->
+        %{begin: begin, end: the_end, char_ident: char_ident}
+
+      %{begin: begin, end: the_end, context: {:dot, _, char_ident}} ->
+        %{begin: begin, end: the_end, char_ident: char_ident}
+
+      _ ->
+        nil
     end
   end
 end

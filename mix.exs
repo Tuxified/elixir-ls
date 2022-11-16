@@ -9,16 +9,17 @@ defmodule ElixirLS.Mixfile do
       start_permanent: Mix.env() == :prod,
       build_per_environment: false,
       deps: deps(),
-      elixir: ">= 1.10.0",
+      elixir: ">= 1.12.3",
       dialyzer: [
-        plt_add_apps: [:dialyxir, :debugger, :dialyzer, :hipe],
+        plt_add_apps: [:dialyxir_vendored, :debugger, :dialyzer, :ex_unit],
         flags: [
           # enable only to verify error handling
           # :unmatched_returns,
           :error_handling,
-          :race_conditions,
           :unknown,
-          :underspecs
+          :underspecs,
+          :extra_return,
+          :missing_return
         ]
       ]
     ]

@@ -9,7 +9,7 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbols do
   alias ElixirLS.LanguageServer.ErlangSourceFile
   alias ElixirLS.LanguageServer.SourceFile
   alias ElixirLS.LanguageServer.Providers.SymbolUtils
-  alias ElixirLS.LanguageServer.JsonRpc
+  require Logger
 
   @arity_suffix_regex ~r/\/\d+$/
 
@@ -73,7 +73,7 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbols do
     end
   end
 
-  @spec notify_uris_modified([String.t()]) :: :ok
+  @spec notify_uris_modified([String.t()]) :: :ok | nil
   def notify_uris_modified(uris, server \\ __MODULE__, override_test_mode \\ false) do
     unless Application.get_env(:language_server, :test_mode) && not override_test_mode do
       GenServer.cast(server, {:uris_modified, uris})
@@ -122,7 +122,7 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbols do
           callbacks_indexed: false
         }
       ) do
-    JsonRpc.log_message(:info, "[ElixirLS WorkspaceSymbols] Indexing...")
+    Logger.info("[ElixirLS WorkspaceSymbols] Indexing...")
 
     module_paths =
       :code.all_loaded()
@@ -133,7 +133,7 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbols do
             do: {module, path}
       end)
 
-    JsonRpc.log_message(:info, "[ElixirLS WorkspaceSymbols] Module discovery complete")
+    Logger.info("[ElixirLS WorkspaceSymbols] Module discovery complete")
 
     index(module_paths)
 
@@ -149,21 +149,18 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbols do
           modified_uris: modified_uris = [_ | _]
         } = state
       ) do
-    JsonRpc.log_message(:info, "[ElixirLS WorkspaceSymbols] Updating index...")
+    Logger.info("[ElixirLS WorkspaceSymbols] Updating index...")
 
     module_paths =
       :code.all_loaded()
       |> process_chunked(fn chunk ->
         for {module, beam_file} <- chunk,
             path = find_module_path(module, beam_file),
-            SourceFile.path_to_uri(path) in modified_uris,
+            SourceFile.Path.to_uri(path) in modified_uris,
             do: {module, path}
       end)
 
-    JsonRpc.log_message(
-      :info,
-      "[ElixirLS WorkspaceSymbols] #{length(module_paths)} modules need reindexing"
-    )
+    Logger.info("[ElixirLS WorkspaceSymbols] #{length(module_paths)} modules need reindexing")
 
     index(module_paths)
 
@@ -428,10 +425,7 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbols do
 
         send(self, {:indexing_complete, key, results})
 
-        JsonRpc.log_message(
-          :info,
-          "[ElixirLS WorkspaceSymbols] #{length(results)} #{key} added to index"
-        )
+        Logger.info("[ElixirLS WorkspaceSymbols] #{length(results)} #{key} added to index")
       end)
 
     :ok
@@ -487,7 +481,7 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbols do
       kind: @symbol_codes |> Map.fetch!(key),
       name: symbol_name(key, symbol),
       location: %{
-        uri: SourceFile.path_to_uri(path),
+        uri: SourceFile.Path.to_uri(path),
         range: build_range(location)
       }
     }
@@ -512,15 +506,18 @@ defmodule ElixirLS.LanguageServer.Providers.WorkspaceSymbols do
 
   @spec build_range(nil | erl_location_t) :: range_t
   defp build_range(nil) do
+    # we don't care about utf16 positions here as we send 0
     %{
       start: %{line: 0, character: 0},
       end: %{line: 1, character: 0}
     }
   end
 
+  # it's not worth to present column info here
   defp build_range({line, _column}), do: build_range(line)
 
   defp build_range(line) do
+    # we don't care about utf16 positions here as we send 0
     %{
       start: %{line: max(line - 1, 0), character: 0},
       end: %{line: line, character: 0}

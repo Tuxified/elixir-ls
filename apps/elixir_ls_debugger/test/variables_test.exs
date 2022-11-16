@@ -39,6 +39,8 @@ defmodule ElixirLS.Debugger.VariablesTest do
     assert Variables.type([1]) == "list"
     assert Variables.type('asd') == "list"
 
+    assert Variables.type(abc: 123) == "keyword"
+
     assert Variables.type(%{}) == "map"
     assert Variables.type(%{asd: 123}) == "map"
     assert Variables.type(%{"asd" => 123}) == "map"
@@ -77,15 +79,20 @@ defmodule ElixirLS.Debugger.VariablesTest do
 
     assert Variables.num_children(:erlang.make_ref()) == 0
 
-    assert Variables.num_children(fn -> :ok end) == 0
+    # As of OTP 24 10 values but it's better not to hardcode that
+    assert Variables.num_children(fn -> :ok end) != 0
 
-    assert Variables.num_children(spawn(fn -> :ok end)) == 0
+    # As of OTP 24 16 values but it's better not to hardcode that
+    assert Variables.num_children(self()) != 0
 
-    assert Variables.num_children(hd(:erlang.ports())) == 0
+    # As of OTP 24 7 values but it's better not to hardcode that
+    assert Variables.num_children(hd(:erlang.ports())) != 0
 
     assert Variables.num_children([]) == 0
     assert Variables.num_children([1]) == 1
     assert Variables.num_children('asd') == 3
+
+    assert Variables.num_children(abc: 123) == 1
 
     assert Variables.num_children(%{}) == 0
     assert Variables.num_children(%{asd: 123}) == 1
@@ -102,6 +109,20 @@ defmodule ElixirLS.Debugger.VariablesTest do
       assert Variables.children([1, 2, 3, 4], 0, 2) == [{"0", 1}, {"1", 2}]
       assert Variables.children([1, 2, 3, 4], 1, 2) == [{"1", 2}, {"2", 3}]
       assert Variables.children('asd', 0, 10) == [{"0", 97}, {"1", 115}, {"2", 100}]
+    end
+
+    test "keyword" do
+      assert Variables.children([abc: 123], 0, 10) == [abc: 123]
+
+      assert Variables.children([abc1: 121, abc2: 122, abc3: 123, abc4: 124], 0, 2) == [
+               abc1: 121,
+               abc2: 122
+             ]
+
+      assert Variables.children([abc1: 121, abc2: 122, abc3: 123, abc4: 124], 1, 2) == [
+               abc2: 122,
+               abc3: 123
+             ]
     end
 
     test "tuple" do
@@ -154,6 +175,24 @@ defmodule ElixirLS.Debugger.VariablesTest do
 
       assert Variables.children(<<0::size(17)>>, 1, 10) == [{"1", 0}, {"2", <<0::size(1)>>}]
       assert Variables.children(<<0::size(17)>>, 1, 1) == [{"1", 0}]
+    end
+
+    test "fun" do
+      children = Variables.children(fn -> :ok end, 0, 10)
+      assert children[:module] == ElixirLS.Debugger.VariablesTest
+      assert children[:type] == :local
+      assert children[:arity] == 0
+    end
+
+    test "pid" do
+      children = Variables.children(self(), 0, 10)
+      assert children[:trap_exit] == false
+      assert children[:status] == :running
+    end
+
+    test "port" do
+      children = Variables.children(hd(:erlang.ports()), 0, 10)
+      assert children[:name] == 'forker'
     end
   end
 end

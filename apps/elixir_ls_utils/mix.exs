@@ -4,13 +4,13 @@ defmodule ElixirLS.Utils.Mixfile do
   def project do
     [
       app: :elixir_ls_utils,
-      version: "0.9.0",
+      version: "0.12.0",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",
       elixirc_paths: elixirc_paths(Mix.env()),
       lockfile: "../../mix.lock",
-      elixir: ">= 1.10.0",
+      elixir: ">= 1.12.3",
       build_embedded: false,
       start_permanent: false,
       build_per_environment: false,
@@ -29,7 +29,7 @@ defmodule ElixirLS.Utils.Mixfile do
     [
       {:jason_vendored, github: "elixir-lsp/jason", branch: "vendored"},
       {:mix_task_archive_deps, github: "elixir-lsp/mix_task_archive_deps"},
-      {:dialyxir, "~> 1.0", runtime: false}
+      {:dialyxir_vendored, github: "elixir-lsp/dialyxir", branch: "vendored", runtime: false}
     ]
   end
 

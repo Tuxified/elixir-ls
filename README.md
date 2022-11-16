@@ -36,6 +36,7 @@ Note: On first run Dialyzer will build a PLT cache which will take a considerabl
 | Kate         | [built-in LSP Client plugin](https://kate-editor.org/post/2020/2020-01-01-kate-lsp-client-status/) | Does not support debugger                        |
 | Neovim       | [coc.nvim](https://github.com/neoclide/coc.nvim)                              | Does not support debugger                                             |
 | Neovim       | [nvim-dap](https://github.com/mfussenegger/nvim-dap)                          | Supports debugger only                                                |
+| Neovim       | [nvim-lspconfig](https://github.com/neovim/nvim-lspconfig)                    | Does not support debugger                                             |
 | Nova         | [nova-elixir-ls](https://github.com/raulchedrese/nova-elixir-ls)              |                                                                       |
 | Sublime Text | [LSP-elixir](https://github.com/sublimelsp/LSP-elixir)                        | Does not support debugger                                             |
 | Vim/Neovim   | [ALE](https://github.com/w0rp/ale)                                            | Does not support debugger or @spec suggestions                        |
@@ -87,7 +88,7 @@ For VSCode install the extension: https://marketplace.visualstudio.com/items?ite
 
 Elixir:
 
-- 1.10.0 minimum
+- 1.11.0 minimum
 
 Erlang:
 
@@ -103,7 +104,7 @@ When debugging in Elixir or Erlang, only modules that have been "interpreted" (u
 
 Currently there is a limit of 100 breakpoints.
 
-### Debuging tests and `.exs` files
+### Debugging tests and `.exs` files
 
 In order to debug modules in `.exs` files (such as tests), they must be specified under `requireFiles` in your launch configuration so they can be loaded and interpreted prior to running the task. For example, the default launch configuration for "mix test" in the VS Code plugin looks like this:
 
@@ -192,15 +193,15 @@ Break conditions are supported and evaluate elixir expressions within the contex
 
 ### Hit conditions
 
-An expression that evaluates to integer can be used to contro how many hits of a breakpoint are ignored before the process is stopped.
+An expression that evaluates to integer can be used to control how many hits of a breakpoint are ignored before the process is stopped.
 
 ### Log points
 
-When log message is set on a breakpoint the debugger will not break but instead log a message to standard output (as required by Debug Adapter Protocol specification). The message may contain interpolated expressions in `{}`, e.g. `my_var is {inspect(my_var)}` and will be evaluated in the context of the process. Special characters `{` and `}` can be emited with escape sequence `\{` and `\}`. As of Debug Adapter Protocol specification version 1.51, log messages are not supported on function breakpoints.
+When log message is set on a breakpoint the debugger will not break but instead log a message to standard output (as required by Debug Adapter Protocol specification). The message may contain interpolated expressions in `{}`, e.g. `my_var is {inspect(my_var)}` and will be evaluated in the context of the process. Special characters `{` and `}` can be emitted with escape sequence `\{` and `\}`. As of Debug Adapter Protocol specification version 1.51, log messages are not supported on function breakpoints.
 
 ### Expression evaluator
 
-An expression evaluator is included in the debbuger. It evaluates elixir expressions in the context of a process stopped on a breakpoint. All bound variables are accessible (no support for attributes as those are compile time). Please note that there are limitations due to `:int` operating on beam instruction level. The binding returns multiple versions of variables in Static Singe Assignment with no indication which one is valid in the current elixir scope. A heuristic is used that selects the highest versions but it does not behave correctly in all cases, e.g. in
+An expression evaluator is included in the debugger. It evaluates elixir expressions in the context of a process stopped on a breakpoint. All bound variables are accessible (no support for attributes as those are compile time). Please note that there are limitations due to `:int` operating on beam instruction level. The binding returns multiple versions of variables in Static Singe Assignment with no indication which one is valid in the current elixir scope. A heuristic is used that selects the highest versions but it does not behave correctly in all cases, e.g. in
 
 ```elixir
 a = 4
@@ -284,7 +285,6 @@ https://github.com/elixir-lsp/elixir-ls/issues/364#issuecomment-829589139
 
 * `.exs` files don't return compilation errors
 * "Fetching n dependencies" sometimes get stuck (remove the `.elixir_ls` directory to fix)
-* Debugger doesn't work in Elixir 1.10.0 - 1.10.2 (but it should work in 1.10.3 when [this fix](https://github.com/elixir-lang/elixir/pull/9864) is released)
 * "Go to definition" does not work within the `scope` of a Phoenix router
 * On first launch dialyzer will cause high CPU usage for a considerable time
 * Dialyzer does not pick up changes involving remote types (https://github.com/elixir-lsp/elixir-ls/issues/502)

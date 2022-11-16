@@ -7,7 +7,9 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
   with the Language Server Protocol. We also attempt to determine the context based on the line
   text before the cursor so we can filter out suggestions that are not relevant.
   """
+  alias ElixirLS.LanguageServer.Protocol.TextEdit
   alias ElixirLS.LanguageServer.SourceFile
+  import ElixirLS.LanguageServer.Protocol, only: [range: 4]
 
   @enforce_keys [:label, :kind, :insert_text, :priority, :tags]
   defstruct [
@@ -20,7 +22,9 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
     # Lower priority is shown higher in the result list
     :priority,
     :tags,
-    :command
+    :command,
+    {:preselect, false},
+    :additional_text_edit
   ]
 
   @func_snippets %{
@@ -90,16 +94,22 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
       |> SourceFile.lines()
       |> Enum.at(line)
 
-    text_before_cursor = String.slice(line_text, 0, character)
-    text_after_cursor = String.slice(line_text, character..-1)
+    # convert to 1 based utf8 position
+    line = line + 1
+    character = SourceFile.lsp_character_to_elixir(line_text, character)
+
+    text_before_cursor = String.slice(line_text, 0, character - 1)
+    text_after_cursor = String.slice(line_text, (character - 1)..-1)
 
     prefix = get_prefix(text_before_cursor)
 
     # TODO: Don't call into here directly
     # Can we use ElixirSense.Providers.Suggestion? ElixirSense.suggestions/3
+    metadata = ElixirSense.Core.Parser.parse_string(text, true, true, line)
+
     env =
-      ElixirSense.Core.Parser.parse_string(text, true, true, line + 1)
-      |> ElixirSense.Core.Metadata.get_env(line + 1)
+      metadata
+      |> ElixirSense.Core.Metadata.get_env(line)
 
     scope =
       case env.scope do
@@ -134,8 +144,18 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
       module: env.module
     }
 
+    position_to_insert_alias =
+      ElixirSense.Core.Metadata.get_position_to_insert_alias(metadata, line) || {line, 0}
+
+    context =
+      Map.put(
+        context,
+        :position_to_insert_alias,
+        SourceFile.elixir_position_to_lsp(text, position_to_insert_alias)
+      )
+
     items =
-      ElixirSense.suggestions(text, line + 1, character + 1)
+      ElixirSense.suggestions(text, line, character, required_alias: true)
       |> maybe_reject_derived_functions(context, options)
       |> Enum.map(&from_completion_item(&1, context, options))
       |> maybe_add_do(context)
@@ -159,7 +179,9 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
         detail: "keyword",
         insert_text: "do\n  $0\nend",
         tags: [],
-        priority: 0
+        priority: 0,
+        # force selection over other longer not exact completions
+        preselect: true
       }
 
       [item | completion_items]
@@ -276,6 +298,48 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
       priority: 15,
       tags: []
     }
+  end
+
+  defp from_completion_item(
+         %{
+           type: :module,
+           name: name,
+           summary: summary,
+           subtype: subtype,
+           metadata: metadata,
+           required_alias: required_alias
+         },
+         %{
+           def_before: nil,
+           position_to_insert_alias: {line_to_insert_alias, column_to_insert_alias}
+         },
+         options
+       ) do
+    completion_without_additional_text_edit =
+      from_completion_item(
+        %{type: :module, name: name, summary: summary, subtype: subtype, metadata: metadata},
+        %{def_before: nil},
+        options
+      )
+
+    alias_value =
+      Atom.to_string(required_alias)
+      |> String.replace_prefix("Elixir.", "")
+
+    indentation =
+      if column_to_insert_alias >= 1,
+        do: 1..column_to_insert_alias |> Enum.map_join(fn _ -> " " end),
+        else: ""
+
+    alias_edit = indentation <> "alias " <> alias_value <> "\n"
+
+    struct(completion_without_additional_text_edit,
+      additional_text_edit: %TextEdit{
+        range: range(line_to_insert_alias, 0, line_to_insert_alias, 0),
+        newText: alias_edit
+      },
+      documentation: alias_value <> "\n" <> summary
+    )
   end
 
   defp from_completion_item(
@@ -561,7 +625,9 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
         completion
       end
 
-    if snippet = snippet_for({origin, name}, context) do
+    file_path = Keyword.get(options, :file_path)
+
+    if snippet = snippet_for({origin, name}, Map.put(context, :file_path, file_path)) do
       %{completion | insert_text: snippet, kind: :snippet, label: name}
     else
       completion
@@ -570,6 +636,17 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
 
   defp from_completion_item(_suggestion, _context, _options) do
     nil
+  end
+
+  defp snippet_for({"Kernel", "defmodule"}, %{file_path: file_path}) when is_binary(file_path) do
+    # In a mix project the file_path can be something like "/some/code/path/project/lib/project/sub_path/my_file.ex"
+    # so we'll try to guess the appropriate module name from the path
+    "defmodule #{suggest_module_name(file_path)}$1 do\n\t$0\nend"
+  end
+
+  defp snippet_for({"Kernel", "defprotocol"}, %{file_path: file_path})
+       when is_binary(file_path) do
+    "defprotocol #{suggest_module_name(file_path)}$1 do\n\t$0\nend"
   end
 
   defp snippet_for(key, %{pipe_before?: true}) do
@@ -587,6 +664,77 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
     else
       "#{def_str}#{name}"
     end
+  end
+
+  def suggest_module_name(file_path) when is_binary(file_path) do
+    file_path
+    |> Path.split()
+    |> Enum.reverse()
+    |> do_suggest_module_name()
+  end
+
+  defp do_suggest_module_name([]), do: nil
+
+  defp do_suggest_module_name([filename | reversed_path]) do
+    filename
+    |> String.split(".")
+    |> case do
+      [file, "ex"] ->
+        do_suggest_module_name(reversed_path, [file], topmost_parent: "lib")
+
+      [file, "exs"] ->
+        if String.ends_with?(file, "_test") do
+          do_suggest_module_name(reversed_path, [file], topmost_parent: "test")
+        else
+          nil
+        end
+
+      _otherwise ->
+        nil
+    end
+  end
+
+  defp do_suggest_module_name([dir | _rest], module_name_acc, topmost_parent: topmost)
+       when dir == topmost do
+    module_name_acc
+    |> Enum.map(&Macro.camelize/1)
+    |> Enum.join(".")
+  end
+
+  defp do_suggest_module_name(
+         [probable_phoenix_dir | [project_web_dir | _] = rest],
+         module_name_acc,
+         opts
+       )
+       when probable_phoenix_dir in [
+              "controllers",
+              "views",
+              "channels",
+              "plugs",
+              "endpoints",
+              "sockets",
+              "live",
+              "components"
+            ] do
+    if String.ends_with?(project_web_dir, "_web") do
+      # by convention Phoenix doesn't use these folders as part of the module names
+      # for modules located inside them, so we'll try to do the same
+      do_suggest_module_name(rest, module_name_acc, opts)
+    else
+      # when not directly under the *_web folder however then we should make the folder
+      # part of the module's name
+      do_suggest_module_name(rest, [probable_phoenix_dir | module_name_acc], opts)
+    end
+  end
+
+  defp do_suggest_module_name([dir_name | rest], module_name_acc, opts) do
+    do_suggest_module_name(rest, [dir_name | module_name_acc], opts)
+  end
+
+  defp do_suggest_module_name([], _module_name_acc, _opts) do
+    # we went all the way up without ever encountering a 'lib' or a 'test' folder
+    # so we ignore the accumulated module name because it's probably wrong/useless
+    nil
   end
 
   def function_snippet(name, args, arity, opts) do
@@ -864,7 +1012,15 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
   end
 
   defp sort_items(items) do
-    Enum.sort_by(items, fn %__MODULE__{priority: priority, label: label} ->
+    Enum.sort_by(items, fn %__MODULE__{priority: priority, label: label} = item ->
+      # deprioretize deprecated
+      priority =
+        if item.tags |> Enum.any?(&(&1 == :deprecated)) do
+          priority + 30
+        else
+          priority
+        end
+
       {priority, label =~ Regex.recompile!(~r/^[^a-zA-Z0-9]/), label}
     end)
   end
@@ -891,6 +1047,12 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
       "filterText" => item.filter_text,
       "sortText" => String.pad_leading(to_string(idx), 8, "0"),
       "insertText" => item.insert_text,
+      "additionalTextEdits" =>
+        if item.additional_text_edit do
+          [item.additional_text_edit]
+        else
+          nil
+        end,
       "command" => item.command,
       "insertTextFormat" =>
         if Keyword.get(options, :snippets_supported, false) do
@@ -899,6 +1061,13 @@ defmodule ElixirLS.LanguageServer.Providers.Completion do
           insert_text_format(:plain_text)
         end
     }
+
+    json =
+      if item.preselect do
+        Map.put(json, "preselect", true)
+      else
+        json
+      end
 
     # deprecated as of Language Server Protocol Specification - 3.15
     json =
